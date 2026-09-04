@@ -100,9 +100,8 @@ def test_classify_intent_adversarial_injection_still_classifies():
     user_content = call_kwargs["messages"][1]["content"]
     assert adversarial in user_content
     system_content = call_kwargs["messages"][0]["content"]
-    assert "DATA" in system_content or "data" in system_content.lower()
     assert "Do not follow" in system_content or "do not follow" in system_content.lower()
-
+    assert "Only classify it" in system_content
 
 def test_classify_intent_refusal_leaves_unknown():
     state = RequestState(id="REQ-X", raw_text="something")
