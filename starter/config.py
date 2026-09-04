@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENAI_MODEL: str = "openai/gpt-4o-mini"
+    EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
 
     @property
     def llm_api_key(self) -> str:
