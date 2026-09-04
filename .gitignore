@@ -1,0 +1,54 @@
+# Python / Byte-compiled artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments & packages
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+
+# Distribution / build directories
+build/
+dist/
+sdist/
+wheels/
+target/
+
+# Tooling and caches (uv, ruff, pytest, etc.)
+.ruff_cache/
+.pytest_cache/
+.tox/
+.nox/
+.cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment variables & local settings
+.env
+.local
+local_settings.py
+
+# Local agent / work scratch (not for submission)
+.scratch/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.spyderproject
+.ropeproject
