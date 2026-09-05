@@ -443,6 +443,32 @@ def execute_tools(
     if not access_grant:
         return state
 
+    # Gate first whenever ticket 03 seeded requires_approval — even if fields incomplete.
+    approved_by: Optional[str] = None
+    if state.requires_approval:
+        if not human_approval_gate(state, approver=approver, decisions=decisions):
+            state.tool_calls.append(
+                ToolCall(
+                    tool="grant_access",
+                    args={
+                        "user": state.fields.get("user_id"),
+                        "resource": state.fields.get("resource"),
+                        "tier": state.fields.get("access_tier"),
+                    },
+                    result={
+                        "ok": False,
+                        "tool": "grant_access",
+                        "data": {"denied_by": approver},
+                        "error": "approval_denied",
+                    },
+                    approved_by=None,
+                )
+            )
+            if "approval_denied" not in state.flags:
+                state.flags.append("approval_denied")
+            return state
+        approved_by = approver
+
     user = state.fields.get("user_id")
     resource = state.fields.get("resource")
     raw_tier = state.fields.get("access_tier")
@@ -458,27 +484,6 @@ def execute_tools(
         if "grant_missing_fields" not in state.flags:
             state.flags.append("grant_missing_fields")
         return state
-
-    approved_by: Optional[str] = None
-    if state.requires_approval:
-        if not human_approval_gate(state, approver=approver, decisions=decisions):
-            state.tool_calls.append(
-                ToolCall(
-                    tool="grant_access",
-                    args={"user": user, "resource": resource, "tier": tier},
-                    result={
-                        "ok": False,
-                        "tool": "grant_access",
-                        "data": {},
-                        "error": "approval_denied",
-                    },
-                    approved_by=None,
-                )
-            )
-            if "approval_denied" not in state.flags:
-                state.flags.append("approval_denied")
-            return state
-        approved_by = approver
 
     _try_grant_access(
         state, user=user, resource=resource, tier=tier, approved_by=approved_by
