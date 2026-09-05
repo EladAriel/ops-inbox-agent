@@ -1,4 +1,4 @@
-"""Tests for starter/labels.json — seam: the answer-key artifact only."""
+"""Tests for eval/labels.json — seam: the answer-key artifact only."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 from starter.state import Action, Intent
 
 _PKG_ROOT = Path(__file__).resolve().parents[1]
-_LABELS_PATH = _PKG_ROOT / "starter" / "labels.json"
+_LABELS_PATH = _PKG_ROOT / "eval" / "labels.json"
 _REQUESTS_PATH = _PKG_ROOT / "requests.jsonl"
 
 VALID_INTENTS = {i.value for i in Intent if i != Intent.UNKNOWN}
