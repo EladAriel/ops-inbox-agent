@@ -1,3 +1,27 @@
+# Submission — Triage & Resolve
+
+**Write-ups:** [DESIGN.md](DESIGN.md) · [AI_USE.md](AI_USE.md)  
+**Outputs:** [results.jsonl](results.jsonl) · [reports/run_report.md](reports/run_report.md) · [reports/eval_report.md](reports/eval_report.md)
+
+### How to run
+
+```bash
+# 1. Secrets (Inference API key — not a Provisioning key)
+cp .env.example .env   # then set OPENROUTER_API_KEY or OPENAI_API_KEY
+
+# 2. Pipeline over all requests -> results.jsonl
+#    TRIAGE_MOCK_APPROVE=all opens the Tier ≥2 gate for batch runs.
+#    Without it, the gate still runs and defaults to deny (no grant).
+TRIAGE_MOCK_APPROVE=all python3 -m starter.pipeline
+
+# 3. Eval harness (per-dimension metrics table)
+python3 -m starter.run_evals
+```
+
+Requires Python 3.10+ and packages from `requirements.txt`. `.env` is gitignored; do not commit keys.
+
+---
+
 # Take-Home Exercise: "Triage & Resolve"
 ### AI Builder / AI Orchestrator — AI Enablement Team
 
