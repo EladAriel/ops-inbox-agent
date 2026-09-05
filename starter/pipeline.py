@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 # Make the sibling `tools` package importable whether run as a module or a script.
@@ -41,12 +41,19 @@ if _PKG_ROOT not in sys.path:
 from tools import create_ticket, grant_access, lookup_user  # noqa: E402
 
 from starter.config import get_openai_client, settings  # noqa: E402
+from starter.decide import (  # noqa: E402
+    INTENT_HANDLERS,
+    _decide_unknown,
+    finalize_decide,
+    looks_like_injection,
+)
 from starter.knowledge_index import KnowledgeIndex  # noqa: E402
 from starter.prompts import (  # noqa: E402
     CLASSIFY_SYSTEM_PROMPT,
     EXTRACT_SYSTEM_PROMPT,
     GROUND_SYSTEM_PROMPT,
 )
+from starter.state import Action, Intent, RequestState, ToolCall  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Paths
@@ -57,26 +64,8 @@ DEFAULT_RESULTS_PATH = os.path.join(_PKG_ROOT, "results.jsonl")
 
 
 # --------------------------------------------------------------------------- #
-# Enums / schema. Typed state passed between stages. Extend as needed.
+# LLM structured-output schemas
 # --------------------------------------------------------------------------- #
-class Intent(str, Enum):
-    ACCESS_REQUEST = "access_request"
-    DATA_PULL = "data_pull"
-    POLICY_QUESTION = "policy_question"
-    BUG_REPORT = "bug_report"
-    PURCHASE_APPROVAL = "purchase_approval"
-    OUT_OF_SCOPE = "out_of_scope"
-    UNKNOWN = "unknown"
-
-
-class Action(str, Enum):
-    AUTO_RESOLVE = "auto_resolve"
-    ROUTE = "route"
-    ESCALATE = "escalate"
-    REJECT = "reject"
-    UNDECIDED = "undecided"
-
-
 class IntentClassification(BaseModel):
     """Structured LLM output: Literal labels only — Intent includes UNKNOWN (app sentinel, not a model choice)."""
 
@@ -97,10 +86,12 @@ class ExtractedFields(BaseModel):
     user_id: Optional[str] = None
     resource: Optional[str] = None
     tier: Optional[str] = None
+    access_tier: Optional[int] = None
     item: Optional[str] = None
     amount_yearly: Optional[float] = None
     data_description: Optional[str] = None
     purpose: Optional[str] = None
+    data_category: Optional[Literal["aggregate", "pii", "regulated", "unclear"]] = None
     summary: Optional[str] = None
     topic: Optional[str] = None
 
@@ -115,64 +106,15 @@ class GroundedPolicyAnswer(BaseModel):
 
 # Keys kept on the audit record per intent (others forced to null).
 _FIELDS_BY_INTENT: Dict[Intent, frozenset[str]] = {
-    Intent.ACCESS_REQUEST: frozenset({"user_id", "resource", "tier"}),
+    Intent.ACCESS_REQUEST: frozenset({"user_id", "resource", "tier", "access_tier"}),
     Intent.PURCHASE_APPROVAL: frozenset({"user_id", "item", "amount_yearly"}),
-    Intent.DATA_PULL: frozenset({"user_id", "data_description", "purpose"}),
+    Intent.DATA_PULL: frozenset(
+        {"user_id", "data_description", "purpose", "data_category"}
+    ),
     Intent.BUG_REPORT: frozenset({"summary", "resource"}),
     Intent.POLICY_QUESTION: frozenset({"topic"}),
     Intent.OUT_OF_SCOPE: frozenset(),
 }
-
-
-@dataclass
-class ToolCall:
-    """Record of a single tool invocation for the audit trail."""
-    tool: str
-    args: Dict[str, Any]
-    result: Dict[str, Any] = field(default_factory=dict)
-    approved_by: Optional[str] = None  # who cleared the approval gate, if applicable
-
-
-@dataclass
-class RequestState:
-    """State object threaded through every pipeline stage.
-
-    This is the audit record. Keep it machine-readable and complete: it is how
-    the eval harness scores you and how a human reconstructs what happened.
-    """
-    id: str
-    raw_text: str
-    label_status: str = "unlabeled"
-
-    intent: Intent = Intent.UNKNOWN
-    fields: Dict[str, Any] = field(default_factory=dict)
-    action: Action = Action.UNDECIDED
-    route_to: Optional[str] = None  # named team queue when action is route
-
-    # Grounding: the answer to a policy question + the doc(s) it is grounded in.
-    answer: Optional[str] = None
-    citations: List[str] = field(default_factory=list)
-
-    tool_calls: List[ToolCall] = field(default_factory=list)
-    requires_approval: bool = False
-    approval_prompt: Optional[str] = None  # what a human would be asked to confirm
-
-    confidence: float = 0.0
-    flags: List[str] = field(default_factory=list)  # e.g. "prompt_injection", "pii"
-
-    # Observability
-    tokens: int = 0
-    cost_usd: float = 0.0
-    latency_ms: float = 0.0
-
-    def to_audit_record(self) -> Dict[str, Any]:
-        """Serialize to a JSON-friendly dict for results.jsonl."""
-        d = asdict(self)
-        d["intent"] = self.intent.value
-        d["action"] = self.action.value
-        d["tool_calls"] = [asdict(tc) for tc in self.tool_calls]
-        return d
-
 
 # --------------------------------------------------------------------------- #
 # Knowledge loading (provided helper — feel free to replace with real retrieval)
@@ -193,7 +135,7 @@ def load_knowledge() -> Dict[str, str]:
 # --------------------------------------------------------------------------- #
 def classify_intent(
     state: RequestState,
-    client: Optional[Any] = None,
+    client: Optional[OpenAI] = None,
     model: Optional[str] = None,
 ) -> RequestState:
     """Classify ``state.raw_text`` into an ``Intent`` via OpenAI structured outputs.
@@ -238,7 +180,7 @@ def classify_intent(
 
 def extract_fields(
     state: RequestState,
-    client: Optional[Any] = None,
+    client: Optional[OpenAI] = None,
     model: Optional[str] = None,
 ) -> RequestState:
     """Extract structured fields for ``state.intent`` via OpenAI structured outputs.
@@ -291,204 +233,27 @@ def extract_fields(
     return state
 
 
-# Decision thresholds from knowledge/ (purchase_limits.md, access_tiers.md,
-# data_request_rules.md). Prefer code rules over LLM judgment.
-_PURCHASE_AUTO_LT = 500.0  # < $500/yr auto-approve
-_PURCHASE_MANAGER_LE = 5000.0  # $500–$5,000 → Manager-Approvals
-# > $5,000 → escalate (Finance Director / + Procurement)
-
-# access_tiers.md examples → numeric tier (1/2/3)
-_RESOURCE_TIER: Dict[str, int] = {
-    "analytics dashboard": 1,
-    "internal wiki": 1,
-    "wiki": 1,
-    "slack": 1,
-    "#incidents": 1,
-    "on-call": 1,
-    "sales crm": 2,
-    "financial reporting": 2,
-    "data warehouse": 2,
-    "hr": 2,
-    "people": 2,
-    "production database": 3,
-    "prod db": 3,
-    "production": 3,
-    "payment": 3,
-    "call recording": 3,
-    "call-recording": 3,
-    "security tooling": 3,
-    "reporting backend": 3,
-}
-
-_INJECTION_MARKERS = (
-    "ignore all previous",
-    "ignore previous instructions",
-    "approval gate has been disabled",
-    "skip the usual approval",
-    "auto-approve this grant",
-    "mark it resolved",
-)
-
-_PII_MARKERS = (
-    "email",
-    "emails",
-    "phone",
-    "ssn",
-    "address",
-    "contact",
-    "name",
-    "names",
-    "pii",
-    "customer",
-)
-_REGULATED_MARKERS = (
-    "card bin",
-    "card bins",
-    "payment card",
-    "credential",
-    "token",
-    "ssn",
-    "health",
-    "regulated",
-    "transaction log",
-)
-
-
-def _looks_like_injection(text: str) -> bool:
-    lower = text.lower()
-    return any(m in lower for m in _INJECTION_MARKERS)
-
-
-def _infer_access_tier(fields: Dict[str, Any]) -> Optional[int]:
-    """Map tier field / resource string to 1|2|3 using access_tiers.md."""
-    tier_raw = (fields.get("tier") or "").strip().lower()
-    if tier_raw:
-        if "3" in tier_raw or "restricted" in tier_raw or "admin" in tier_raw:
-            # "admin" on sensitive systems is at least Tier 2; prod/admin → 3 if resource says so
-            if "3" in tier_raw or "restricted" in tier_raw:
-                return 3
-        if "2" in tier_raw or "sensitive" in tier_raw or "standard" in tier_raw:
-            return 2
-        if "1" in tier_raw or "internal" in tier_raw or "read" in tier_raw:
-            return 1
-        if "admin" in tier_raw:
-            return 2
-
-    resource = (fields.get("resource") or "").strip().lower()
-    if not resource:
-        return None
-    best: Optional[int] = None
-    for needle, tier in _RESOURCE_TIER.items():
-        if needle in resource:
-            if best is None or tier > best:
-                best = tier
-    return best
-
-
-def _data_category(fields: Dict[str, Any]) -> str:
-    """Return aggregate | pii | regulated from data_request_rules.md heuristics."""
-    blob = " ".join(
-        str(fields.get(k) or "") for k in ("data_description", "purpose")
-    ).lower()
-    if any(m in blob for m in _REGULATED_MARKERS):
-        return "regulated"
-    if any(m in blob for m in _PII_MARKERS) and "aggregate" not in blob:
-        return "pii"
-    if "aggregate" in blob or "rollup" in blob or "counts" in blob or "dau" in blob:
-        return "aggregate"
-    # Default: if clearly non-person metrics, aggregate; else escalate as unclear
-    if any(
-        w in blob
-        for w in ("signups", "revenue", "volume", "funnel", "by region", "by product")
-    ):
-        return "aggregate"
-    return "unclear"
-
-
 def decide_action(state: RequestState) -> RequestState:
-    """Decide ``auto_resolve`` | ``route`` | ``escalate`` | ``reject`` via policy rules.
+    """Decide ``auto_resolve`` | ``route`` | ``escalate`` | ``reject``.
 
-    Thresholds from knowledge/*.md (see module constants). Sets ``requires_approval``
-    for Tier 2/3 grants. Injection / OOS never ``auto_resolve``.
+    Apply the policy docs (tiers, purchase bands, data categories). Prefer
+    deterministic rules where the policy is deterministic. Set
+    ``state.requires_approval`` for any mutating action above the risk threshold.
     """
-    if _looks_like_injection(state.raw_text):
+    if looks_like_injection(state.raw_text):
         if "prompt_injection" not in state.flags:
             state.flags.append("prompt_injection")
 
-    if state.intent == Intent.OUT_OF_SCOPE:
-        state.action = Action.REJECT
-        return _finalize_decide(state)
-
-    if state.intent == Intent.POLICY_QUESTION:
-        state.action = Action.AUTO_RESOLVE
-        return _finalize_decide(state)
-
-    if state.intent == Intent.BUG_REPORT:
-        state.action = Action.ROUTE
-        state.route_to = "Engineering"
-        return _finalize_decide(state)
-
-    if state.intent == Intent.PURCHASE_APPROVAL:
-        amount = state.fields.get("amount_yearly")
-        if amount is None:
-            state.action = Action.ESCALATE
-        else:
-            amount_f = float(amount)
-            if amount_f < _PURCHASE_AUTO_LT:
-                state.action = Action.AUTO_RESOLVE
-            elif amount_f <= _PURCHASE_MANAGER_LE:
-                state.action = Action.ROUTE
-                state.route_to = "Manager-Approvals"
-            else:
-                state.action = Action.ESCALATE
-        return _finalize_decide(state)
-
-    if state.intent == Intent.DATA_PULL:
-        cat = _data_category(state.fields)
-        if cat == "aggregate":
-            state.action = Action.ROUTE
-            state.route_to = "Data-Analytics"
-        else:
-            state.action = Action.ESCALATE
-        return _finalize_decide(state)
-
-    if state.intent == Intent.ACCESS_REQUEST:
-        tier = _infer_access_tier(state.fields)
-        if tier is None:
-            state.action = Action.ESCALATE
-        elif tier >= 2:
-            state.action = Action.ESCALATE
-            state.requires_approval = True
-            resource = state.fields.get("resource") or "requested resource"
-            state.approval_prompt = (
-                f"Approve Tier {tier} grant_access for {resource}? "
-                "Policy requires human approval; do not auto-grant."
-            )
-        else:
-            state.action = Action.AUTO_RESOLVE
-        return _finalize_decide(state)
-
-    state.action = Action.ESCALATE
-    return _finalize_decide(state)
-
-
-def _finalize_decide(state: RequestState) -> RequestState:
-    """Block auto_resolve when prompt injection was flagged."""
-    if "prompt_injection" in state.flags and state.action == Action.AUTO_RESOLVE:
-        state.action = Action.ESCALATE
-        state.requires_approval = True
-        state.approval_prompt = (
-            state.approval_prompt
-            or "Adversarial language detected; confirm before resolving."
-        )
-    return state
+    handler = INTENT_HANDLERS.get(state.intent, _decide_unknown)
+    handler(state)
+    return finalize_decide(state)
 
 
 def ground_policy_answer(
     state: RequestState,
     *,
     index: Optional[KnowledgeIndex] = None,
-    client: Optional[Any] = None,
+    client: Optional[OpenAI] = None,
     model: Optional[str] = None,
     embed_model: Optional[str] = None,
 ) -> RequestState:
@@ -508,8 +273,19 @@ def ground_policy_answer(
             load_knowledge(), openai_client, emb_model
         )
 
-    query = (state.fields.get("topic") or state.raw_text or "").strip()
+    # Prefer raw_text for retrieval — short topic paraphrases can starve embeddings
+    # (e.g. "customer data sharing policy" missing "email / phone / external vendor").
+    topic = str(state.fields.get("topic") or "").strip()
+    raw = (state.raw_text or "").strip()
+    query = raw or topic
     hits = index.retrieve(query, openai_client, emb_model, top_k=4)
+    if not hits:
+        state.action = Action.ESCALATE
+        state.answer = "Docs do not cover this question; escalating."
+        state.citations = []
+        state.flags.append("ground_no_hits")
+        return state
+
     allowed_citations = {c.citation for c in hits}
     context = "\n\n".join(f"[{c.citation}]\n{c.heading}\n{c.text}" for c in hits)
 
@@ -520,9 +296,9 @@ def ground_policy_answer(
             {
                 "role": "user",
                 "content": (
-                    "Knowledge excerpts:\n"
+                    "Knowledge selected chunks:\n"
                     f"{context or '(none)'}\n\n"
-                    "Answer the policy question using only those excerpts.\n\n"
+                    "Answer the policy question using only those selected chunks.\n\n"
                     f"<message>\n{state.raw_text}\n</message>"
                 ),
             },
@@ -555,37 +331,219 @@ def ground_policy_answer(
     return state
 
 
-def human_approval_gate(state: RequestState, approver: str = "MOCK_APPROVER") -> bool:
-    """TODO: Implement the approval gate for mutating actions above threshold.
+def human_approval_gate(
+    state: RequestState,
+    approver: str = "MOCK_APPROVER",
+    *,
+    decisions: Optional[Dict[str, bool]] = None,
+) -> bool:
+    """Explicit stop for mutating actions above the risk threshold.
 
-    Must be a real stop in the pipeline — not a comment or a print. In a batch/
-    eval run this can be a mock approver (e.g. read from a decision map, env var,
-    or always-deny), but the CONTROL FLOW must genuinely prevent ``grant_access``
-    from firing unless approval is granted. Return True iff approved.
+    Batch/eval: pass ``decisions`` keyed by request id, or set env
+    ``TRIAGE_MOCK_APPROVE`` to ``all`` / comma-separated ids. Default deny.
     """
-    # Placeholder: deny by default so nothing mutating fires from the scaffold.
+    _ = approver  # caller records approved_by on ToolCall
+    if decisions is not None:
+        return bool(decisions.get(state.id, False))
+
+    mode = (os.environ.get("TRIAGE_MOCK_APPROVE") or "deny").strip().lower()
+    if mode in ("1", "true", "all", "yes"):
+        return True
+    if mode in ("0", "false", "deny", "no", ""):
+        return False
+    allowed = {x.strip() for x in mode.split(",") if x.strip()}
+    return state.id in allowed
+
+
+_GRANT_RETRY_BACKOFF_S = 0.05
+
+
+def _safe_ticket_payload(state: RequestState) -> Dict[str, Any]:
+    """Ticket payload without raw_text or raw PII — user_id / structured fields only."""
+    fields = state.fields or {}
+    summary = (
+        fields.get("summary")
+        or fields.get("data_description")
+        or fields.get("item")
+        or fields.get("resource")
+    )
+    return {
+        "request_id": state.id,
+        "intent": state.intent.value,
+        "user_id": fields.get("user_id"),
+        "resource": fields.get("resource"),
+        "summary": summary,
+        "amount_yearly": fields.get("amount_yearly"),
+        "data_category": fields.get("data_category"),
+        "access_tier": fields.get("access_tier"),
+    }
+
+
+def _try_grant_access(
+    state: RequestState,
+    *,
+    user: str,
+    resource: str,
+    tier: int,
+    approved_by: Optional[str],
+) -> bool:
+    """Call grant_access once, retry once on failure, escalate if still failing.
+
+    Returns True if a successful grant was recorded.
+    """
+    args = {"user": user, "resource": resource, "tier": tier}
+    for attempt in range(2):
+        result = grant_access(user, resource, tier)
+        state.tool_calls.append(
+            ToolCall(
+                tool="grant_access",
+                args=args,
+                result=result,
+                approved_by=approved_by,
+            )
+        )
+        if result.get("ok"):
+            return True
+        if attempt == 0:
+            time.sleep(_GRANT_RETRY_BACKOFF_S)
+    state.action = Action.ESCALATE
+    if "grant_access_failed" not in state.flags:
+        state.flags.append("grant_access_failed")
     return False
 
 
-def execute_tools(state: RequestState) -> RequestState:
-    """TODO: Perform the decided action via the stub tools.
+def execute_tools(
+    state: RequestState,
+    *,
+    decisions: Optional[Dict[str, bool]] = None,
+    approver: str = "MOCK_APPROVER",
+) -> RequestState:
+    """Perform the decided action via stub tools (gate before grant_access).
 
-    - ``route``  -> ``create_ticket(team, payload)`` (no raw PII in payload!).
-    - ``auto_resolve`` for access -> ``grant_access(...)`` ONLY for below-threshold
-      grants; anything gated must pass ``human_approval_gate`` first.
-    - Handle ``grant_access`` failures gracefully (it fails ~15% of the time):
-      retry / backoff / escalate — your call, and justify it in the write-up.
-    - Append every attempt to ``state.tool_calls``.
+    - ``route`` -> ``create_ticket`` (no raw PII in payload).
+    - Tier-1 ``auto_resolve`` access -> ``grant_access`` without gate.
+    - ``requires_approval`` -> ``human_approval_gate`` then grant only if True.
+    - Flaky ``grant_access``: one short backoff retry, then escalate; every try logged.
     """
+    if state.action == Action.ROUTE and state.route_to:
+        payload = _safe_ticket_payload(state)
+        result = create_ticket(state.route_to, payload)
+        state.tool_calls.append(
+            ToolCall(
+                tool="create_ticket",
+                args={"team": state.route_to, "payload": payload},
+                result=result,
+            )
+        )
+        return state
+
+    access_grant = state.intent == Intent.ACCESS_REQUEST and (
+        state.action == Action.AUTO_RESOLVE or state.requires_approval
+    )
+    if not access_grant:
+        return state
+
+    user = state.fields.get("user_id")
+    resource = state.fields.get("resource")
+    raw_tier = state.fields.get("access_tier")
+    if not user or not resource or raw_tier is None:
+        state.action = Action.ESCALATE
+        if "grant_missing_fields" not in state.flags:
+            state.flags.append("grant_missing_fields")
+        return state
+    try:
+        tier = int(raw_tier)
+    except (TypeError, ValueError):
+        state.action = Action.ESCALATE
+        if "grant_missing_fields" not in state.flags:
+            state.flags.append("grant_missing_fields")
+        return state
+
+    approved_by: Optional[str] = None
+    if state.requires_approval:
+        if not human_approval_gate(state, approver=approver, decisions=decisions):
+            state.tool_calls.append(
+                ToolCall(
+                    tool="grant_access",
+                    args={"user": user, "resource": resource, "tier": tier},
+                    result={
+                        "ok": False,
+                        "tool": "grant_access",
+                        "data": {},
+                        "error": "approval_denied",
+                    },
+                    approved_by=None,
+                )
+            )
+            if "approval_denied" not in state.flags:
+                state.flags.append("approval_denied")
+            return state
+        approved_by = approver
+
+    _try_grant_access(
+        state, user=user, resource=resource, tier=tier, approved_by=approved_by
+    )
     return state
 
 
-def redact_pii(state: RequestState) -> RequestState:
-    """TODO (recommended): ensure no raw sensitive PII lands in the audit record.
+_SSN_RE = re.compile(r"\b(\d{3})-(\d{2})-(\d{4})\b")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+# 555-0142 or 617-555-0199 or 555.0142
+_PHONE_RE = re.compile(
+    r"\b(?:\d{3}[-.\s]?)?\d{3}[-.\s]?\d{4}\b"
+)
+_ADDRESS_RE = re.compile(
+    r"\b\d+\s+[A-Za-z0-9.'\-]+(?:\s+[A-Za-z0-9.'\-]+)*\s+"
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Ln|Lane|Dr|Drive|Ct|Court)\b",
+    re.IGNORECASE,
+)
 
-    e.g. mask SSNs to last 4, redact personal emails/phones/addresses. See
-    knowledge/pii_handling.md. Flag PII presence in ``state.flags``.
-    """
+
+def _mask_pii_text(text: str) -> tuple[str, bool]:
+    """Return (masked_text, found_pii)."""
+    if not text:
+        return text, False
+    found = False
+
+    def _ssn(m: re.Match[str]) -> str:
+        nonlocal found
+        found = True
+        return f"***-**-{m.group(3)}"
+
+    def _mark(repl: str):
+        def _fn(_m: re.Match[str]) -> str:
+            nonlocal found
+            found = True
+            return repl
+
+        return _fn
+
+    out = _SSN_RE.sub(_ssn, text)
+    out = _EMAIL_RE.sub(_mark("[REDACTED_EMAIL]"), out)
+    out = _ADDRESS_RE.sub(_mark("[REDACTED_ADDRESS]"), out)
+    out = _PHONE_RE.sub(_mark("[REDACTED_PHONE]"), out)
+    return out, found
+
+
+def redact_pii(state: RequestState) -> RequestState:
+    """Mask SSN / email / phone / address in audit fields per knowledge/pii_handling.md."""
+    found_any = False
+
+    state.raw_text, hit = _mask_pii_text(state.raw_text)
+    found_any = found_any or hit
+
+    if state.answer:
+        state.answer, hit = _mask_pii_text(state.answer)
+        found_any = found_any or hit
+
+    for key, val in list(state.fields.items()):
+        if isinstance(val, str):
+            masked, hit = _mask_pii_text(val)
+            state.fields[key] = masked
+            found_any = found_any or hit
+
+    if found_any and "contains_pii" not in state.flags:
+        state.flags.append("contains_pii")
     return state
 
 
@@ -597,7 +555,7 @@ def process_request(
     knowledge: Dict[str, str],
     *,
     index: Optional[KnowledgeIndex] = None,
-    client: Optional[Any] = None,
+    client: Optional[OpenAI] = None,
 ) -> RequestState:
     """Run one request through all stages and return the completed state.
 
