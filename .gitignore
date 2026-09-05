@@ -42,7 +42,7 @@ htmlcov/
 .local
 local_settings.py
 
-# Local agent / work scratch (not for submission)
+# Local agent / runtime scratch (not for submission). Reviewer-facing notes: docs/scratch/
 .scratch/
 
 # IDEs and editors
@@ -52,3 +52,9 @@ local_settings.py
 *.swo
 .spyderproject
 .ropeproject
+
+# Wiki
+ref/
+
+# KG
+graphify-out/

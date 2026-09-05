@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from typing import Any, Dict, List, Literal, Optional
@@ -38,8 +37,13 @@ _PKG_ROOT = os.path.dirname(_HERE)  # candidate-package/
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 
-from tools import create_ticket, grant_access, lookup_user  # noqa: E402
+from tools import create_ticket, lookup_user  # noqa: E402
 
+from starter.audit import (  # noqa: E402
+    emit_results_jsonl,
+    failure_audit_record,
+    finalize_audit,
+)
 from starter.config import get_openai_client, settings  # noqa: E402
 from starter.decide import (  # noqa: E402
     INTENT_HANDLERS,
@@ -48,12 +52,19 @@ from starter.decide import (  # noqa: E402
     looks_like_injection,
 )
 from starter.knowledge_index import KnowledgeIndex  # noqa: E402
+from starter.pii import mask_pii_in_value, mask_pii_text  # noqa: E402
 from starter.prompts import (  # noqa: E402
     CLASSIFY_SYSTEM_PROMPT,
     EXTRACT_SYSTEM_PROMPT,
     GROUND_SYSTEM_PROMPT,
 )
-from starter.state import Action, Intent, RequestState, ToolCall  # noqa: E402
+from starter.state import Action, Intent, RequestState  # noqa: E402
+from starter.tool_actions import (  # noqa: E402
+    append_tool_call,
+    safe_ticket_payload,
+    try_grant_access,
+)
+from starter.usage import record_chat_usage, record_embedding_usage  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Paths
@@ -146,24 +157,29 @@ def classify_intent(
     openai_client = client if client is not None else get_openai_client()
     model_name = model or settings.OPENAI_MODEL
 
-    completion = openai_client.chat.completions.parse(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Classify the following Ops inbox message.\n\n"
-                    f"<message>\n{state.raw_text}\n</message>"
-                ),
-            },
-        ],
-        response_format=IntentClassification,
-    )
+    try:
+        completion = openai_client.chat.completions.parse(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Classify the following Ops inbox message.\n\n"
+                        f"<message>\n{state.raw_text}\n</message>"
+                    ),
+                },
+            ],
+            response_format=IntentClassification,
+        )
+    except Exception:
+        state.intent = Intent.UNKNOWN
+        state.confidence = 0.0
+        if "classify_api_error" not in state.flags:
+            state.flags.append("classify_api_error")
+        return state
 
-    usage = getattr(completion, "usage", None)
-    if usage is not None and getattr(usage, "total_tokens", None) is not None:
-        state.tokens += int(usage.total_tokens)
+    record_chat_usage(state, completion)
 
     message = completion.choices[0].message
     parsed = getattr(message, "parsed", None)
@@ -194,25 +210,29 @@ def extract_fields(
     openai_client = client if client is not None else get_openai_client()
     model_name = model or settings.OPENAI_MODEL
 
-    completion = openai_client.chat.completions.parse(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Intent: {state.intent.value}\n\n"
-                    "Extract fields from the following Ops inbox message.\n\n"
-                    f"<message>\n{state.raw_text}\n</message>"
-                ),
-            },
-        ],
-        response_format=ExtractedFields,
-    )
+    try:
+        completion = openai_client.chat.completions.parse(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Intent: {state.intent.value}\n\n"
+                        "Extract fields from the following Ops inbox message.\n\n"
+                        f"<message>\n{state.raw_text}\n</message>"
+                    ),
+                },
+            ],
+            response_format=ExtractedFields,
+        )
+    except Exception:
+        state.fields = {}
+        if "extract_api_error" not in state.flags:
+            state.flags.append("extract_api_error")
+        return state
 
-    usage = getattr(completion, "usage", None)
-    if usage is not None and getattr(usage, "total_tokens", None) is not None:
-        state.tokens += int(usage.total_tokens)
+    record_chat_usage(state, completion)
 
     message = completion.choices[0].message
     parsed = getattr(message, "parsed", None)
@@ -226,10 +246,19 @@ def extract_fields(
     state.fields = {k: (v if k in allowed else None) for k, v in state.fields.items()}
     user_id = state.fields.get("user_id")
     if user_id:
-        result = lookup_user(user_id)
-        state.tool_calls.append(
-            ToolCall(tool="lookup_user", args={"user_id": user_id}, result=result)
-        )
+        try:
+            result = lookup_user(user_id)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "tool": "lookup_user",
+                "data": {},
+                "error": str(exc),
+            }
+            state.action = Action.ESCALATE
+            if "lookup_user_failed" not in state.flags:
+                state.flags.append("lookup_user_failed")
+        append_tool_call(state, "lookup_user", {"user_id": user_id}, result)
     return state
 
 
@@ -278,7 +307,21 @@ def ground_policy_answer(
     topic = str(state.fields.get("topic") or "").strip()
     raw = (state.raw_text or "").strip()
     query = raw or topic
-    hits = index.retrieve(query, openai_client, emb_model, top_k=4)
+    try:
+        hits = index.retrieve(
+            query,
+            openai_client,
+            emb_model,
+            top_k=4,
+            on_usage=lambda resp: record_embedding_usage(state, resp),
+        )
+    except Exception:
+        state.action = Action.ESCALATE
+        state.answer = "Could not retrieve policy docs; escalating."
+        state.citations = []
+        if "ground_retrieve_error" not in state.flags:
+            state.flags.append("ground_retrieve_error")
+        return state
     if not hits:
         state.action = Action.ESCALATE
         state.answer = "Docs do not cover this question; escalating."
@@ -289,26 +332,32 @@ def ground_policy_answer(
     allowed_citations = {c.citation for c in hits}
     context = "\n\n".join(f"[{c.citation}]\n{c.heading}\n{c.text}" for c in hits)
 
-    completion = openai_client.chat.completions.parse(
-        model=chat_model,
-        messages=[
-            {"role": "system", "content": GROUND_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Knowledge selected chunks:\n"
-                    f"{context or '(none)'}\n\n"
-                    "Answer the policy question using only those selected chunks.\n\n"
-                    f"<message>\n{state.raw_text}\n</message>"
-                ),
-            },
-        ],
-        response_format=GroundedPolicyAnswer,
-    )
+    try:
+        completion = openai_client.chat.completions.parse(
+            model=chat_model,
+            messages=[
+                {"role": "system", "content": GROUND_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Knowledge selected chunks:\n"
+                        f"{context or '(none)'}\n\n"
+                        "Answer the policy question using only those selected chunks.\n\n"
+                        f"<message>\n{state.raw_text}\n</message>"
+                    ),
+                },
+            ],
+            response_format=GroundedPolicyAnswer,
+        )
+    except Exception:
+        state.action = Action.ESCALATE
+        state.answer = "Could not ground a policy answer; escalating."
+        state.citations = []
+        if "ground_api_error" not in state.flags:
+            state.flags.append("ground_api_error")
+        return state
 
-    usage = getattr(completion, "usage", None)
-    if usage is not None and getattr(usage, "total_tokens", None) is not None:
-        state.tokens += int(usage.total_tokens)
+    record_chat_usage(state, completion)
 
     message = completion.choices[0].message
     parsed = getattr(message, "parsed", None)
@@ -341,75 +390,22 @@ def human_approval_gate(
 
     Batch/eval: pass ``decisions`` keyed by request id, or set env
     ``TRIAGE_MOCK_APPROVE`` to ``all`` / comma-separated ids. Default deny.
+    Id matching is case-insensitive.
     """
     _ = approver  # caller records approved_by on ToolCall
     if decisions is not None:
-        return bool(decisions.get(state.id, False))
+        if state.id in decisions:
+            return bool(decisions[state.id])
+        lower = {str(k).lower(): v for k, v in decisions.items()}
+        return bool(lower.get(state.id.lower(), False))
 
     mode = (os.environ.get("TRIAGE_MOCK_APPROVE") or "deny").strip().lower()
     if mode in ("1", "true", "all", "yes"):
         return True
     if mode in ("0", "false", "deny", "no", ""):
         return False
-    allowed = {x.strip() for x in mode.split(",") if x.strip()}
-    return state.id in allowed
-
-
-_GRANT_RETRY_BACKOFF_S = 0.05
-
-
-def _safe_ticket_payload(state: RequestState) -> Dict[str, Any]:
-    """Ticket payload without raw_text or raw PII — user_id / structured fields only."""
-    fields = state.fields or {}
-    summary = (
-        fields.get("summary")
-        or fields.get("data_description")
-        or fields.get("item")
-        or fields.get("resource")
-    )
-    return {
-        "request_id": state.id,
-        "intent": state.intent.value,
-        "user_id": fields.get("user_id"),
-        "resource": fields.get("resource"),
-        "summary": summary,
-        "amount_yearly": fields.get("amount_yearly"),
-        "data_category": fields.get("data_category"),
-        "access_tier": fields.get("access_tier"),
-    }
-
-
-def _try_grant_access(
-    state: RequestState,
-    *,
-    user: str,
-    resource: str,
-    tier: int,
-    approved_by: Optional[str],
-) -> bool:
-    """Call grant_access once, retry once on failure, escalate if still failing.
-
-    Returns True if a successful grant was recorded.
-    """
-    args = {"user": user, "resource": resource, "tier": tier}
-    for attempt in range(2):
-        result = grant_access(user, resource, tier)
-        state.tool_calls.append(
-            ToolCall(
-                tool="grant_access",
-                args=args,
-                result=result,
-                approved_by=approved_by,
-            )
-        )
-        if result.get("ok"):
-            return True
-        if attempt == 0:
-            time.sleep(_GRANT_RETRY_BACKOFF_S)
-    state.action = Action.ESCALATE
-    if "grant_access_failed" not in state.flags:
-        state.flags.append("grant_access_failed")
-    return False
+    allowed = {x.strip().lower() for x in mode.split(",") if x.strip()}
+    return state.id.lower() in allowed
 
 
 def execute_tools(
@@ -423,18 +419,27 @@ def execute_tools(
     - ``route`` -> ``create_ticket`` (no raw PII in payload).
     - Tier-1 ``auto_resolve`` access -> ``grant_access`` without gate.
     - ``requires_approval`` -> ``human_approval_gate`` then grant only if True.
+    - ``prompt_injection`` -> never ``grant_access``, even if the gate would approve.
+    - Successful grant -> ``auto_resolve`` (including post-approval Tier 2/3).
     - Flaky ``grant_access``: one short backoff retry, then escalate; every try logged.
     """
     if state.action == Action.ROUTE and state.route_to:
-        payload = _safe_ticket_payload(state)
-        result = create_ticket(state.route_to, payload)
-        state.tool_calls.append(
-            ToolCall(
-                tool="create_ticket",
-                args={"team": state.route_to, "payload": payload},
-                result=result,
-            )
-        )
+        payload = safe_ticket_payload(state)
+        args = {"team": state.route_to, "payload": payload}
+        try:
+            result = create_ticket(state.route_to, payload)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "tool": "create_ticket",
+                "data": {},
+                "error": str(exc),
+            }
+        append_tool_call(state, "create_ticket", args, result)
+        if not result.get("ok"):
+            state.action = Action.ESCALATE
+            if "create_ticket_failed" not in state.flags:
+                state.flags.append("create_ticket_failed")
         return state
 
     access_grant = state.intent == Intent.ACCESS_REQUEST and (
@@ -443,31 +448,51 @@ def execute_tools(
     if not access_grant:
         return state
 
+    grant_args = {
+        "user": state.fields.get("user_id"),
+        "resource": state.fields.get("resource"),
+        "tier": state.fields.get("access_tier"),
+    }
+
     # Gate first whenever ticket 03 seeded requires_approval — even if fields incomplete.
     approved_by: Optional[str] = None
     if state.requires_approval:
         if not human_approval_gate(state, approver=approver, decisions=decisions):
-            state.tool_calls.append(
-                ToolCall(
-                    tool="grant_access",
-                    args={
-                        "user": state.fields.get("user_id"),
-                        "resource": state.fields.get("resource"),
-                        "tier": state.fields.get("access_tier"),
-                    },
-                    result={
-                        "ok": False,
-                        "tool": "grant_access",
-                        "data": {"denied_by": approver},
-                        "error": "approval_denied",
-                    },
-                    approved_by=None,
-                )
+            append_tool_call(
+                state,
+                "grant_access",
+                grant_args,
+                {
+                    "ok": False,
+                    "tool": "grant_access",
+                    "data": {"denied_by": approver},
+                    "error": "approval_denied",
+                },
+                approved_by=None,
             )
             if "approval_denied" not in state.flags:
                 state.flags.append("approval_denied")
             return state
         approved_by = approver
+
+    # Adversarial / injection: never mutate access, even after a mock/human approve.
+    if "prompt_injection" in state.flags:
+        append_tool_call(
+            state,
+            "grant_access",
+            grant_args,
+            {
+                "ok": False,
+                "tool": "grant_access",
+                "data": {"blocked_reason": "prompt_injection"},
+                "error": "prompt_injection_blocked",
+            },
+            approved_by=None,
+        )
+        state.action = Action.ESCALATE
+        if "prompt_injection_blocked" not in state.flags:
+            state.flags.append("prompt_injection_blocked")
+        return state
 
     user = state.fields.get("user_id")
     resource = state.fields.get("resource")
@@ -485,72 +510,46 @@ def execute_tools(
             state.flags.append("grant_missing_fields")
         return state
 
-    _try_grant_access(
+    granted = try_grant_access(
         state, user=user, resource=resource, tier=tier, approved_by=approved_by
     )
+    if granted:
+        state.action = Action.AUTO_RESOLVE
     return state
 
 
-_SSN_RE = re.compile(r"\b(\d{3})-(\d{2})-(\d{4})\b")
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-# 555-0142 or 617-555-0199 or 555.0142
-_PHONE_RE = re.compile(
-    r"\b(?:\d{3}[-.\s]?)?\d{3}[-.\s]?\d{4}\b"
-)
-_ADDRESS_RE = re.compile(
-    r"\b\d+\s+[A-Za-z0-9.'\-]+(?:\s+[A-Za-z0-9.'\-]+)*\s+"
-    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Ln|Lane|Dr|Drive|Ct|Court)\b",
-    re.IGNORECASE,
-)
-
-
-def _mask_pii_text(text: str) -> tuple[str, bool]:
-    """Return (masked_text, found_pii)."""
-    if not text:
-        return text, False
-    found = False
-
-    def _ssn(m: re.Match[str]) -> str:
-        nonlocal found
-        found = True
-        return f"***-**-{m.group(3)}"
-
-    def _mark(repl: str):
-        def _fn(_m: re.Match[str]) -> str:
-            nonlocal found
-            found = True
-            return repl
-
-        return _fn
-
-    out = _SSN_RE.sub(_ssn, text)
-    out = _EMAIL_RE.sub(_mark("[REDACTED_EMAIL]"), out)
-    out = _ADDRESS_RE.sub(_mark("[REDACTED_ADDRESS]"), out)
-    out = _PHONE_RE.sub(_mark("[REDACTED_PHONE]"), out)
-    return out, found
-
-
 def redact_pii(state: RequestState) -> RequestState:
-    """Mask SSN / email / phone / address in audit fields per knowledge/pii_handling.md."""
+    """Ensure no raw sensitive PII lands in the audit record.
+
+    Masks SSN / email / phone / address in raw_text, answer, fields, and
+    nested tool_calls results. See knowledge/pii_handling.md.
+    """
     found_any = False
 
-    state.raw_text, hit = _mask_pii_text(state.raw_text)
+    state.raw_text, hit = mask_pii_text(state.raw_text)
     found_any = found_any or hit
 
     if state.answer:
-        state.answer, hit = _mask_pii_text(state.answer)
+        state.answer, hit = mask_pii_text(state.answer)
         found_any = found_any or hit
 
     for key, val in list(state.fields.items()):
         if isinstance(val, str):
-            masked, hit = _mask_pii_text(val)
+            masked, hit = mask_pii_text(val)
             state.fields[key] = masked
             found_any = found_any or hit
+
+    for tc in state.tool_calls:
+        masked_args, hit_a = mask_pii_in_value(tc.args)
+        tc.args = masked_args if isinstance(masked_args, dict) else tc.args
+        found_any = found_any or hit_a
+        masked_result, hit_r = mask_pii_in_value(tc.result)
+        tc.result = masked_result if isinstance(masked_result, dict) else tc.result
+        found_any = found_any or hit_r
 
     if found_any and "contains_pii" not in state.flags:
         state.flags.append("contains_pii")
     return state
-
 
 # --------------------------------------------------------------------------- #
 # Orchestration
@@ -580,17 +579,20 @@ def process_request(
     state = ground_policy_answer(state, index=index, client=client)
     state = redact_pii(state)
     state = execute_tools(state)
+    state = redact_pii(state)
 
     state.latency_ms = (time.perf_counter() - t0) * 1000.0
-    return state
+    return finalize_audit(state)
 
 
-def load_requests(path: str = REQUESTS_PATH) -> List[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as fh:
+def load_requests(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    req_path = path if path is not None else REQUESTS_PATH
+    with open(req_path, "r", encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _ = argv
     requests = load_requests()
     knowledge = load_knowledge()
     client = get_openai_client()
@@ -600,12 +602,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     results: List[Dict[str, Any]] = []
 
     for raw in requests:
-        state = process_request(raw, knowledge, index=index, client=client)
-        results.append(state.to_audit_record())
+        t0 = time.perf_counter()
+        try:
+            state = process_request(raw, knowledge, index=index, client=client)
+            results.append(state.to_audit_record())
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            results.append(failure_audit_record(raw, exc, latency_ms=latency_ms))
 
-    with open(DEFAULT_RESULTS_PATH, "w", encoding="utf-8") as fh:
-        for rec in results:
-            fh.write(json.dumps(rec) + "\n")
+    emit_results_jsonl(DEFAULT_RESULTS_PATH, results)
 
     print(f"processed {len(results)} requests -> {DEFAULT_RESULTS_PATH}")
     return 0

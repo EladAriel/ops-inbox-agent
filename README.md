@@ -1,11 +1,14 @@
 # Submission — Triage & Resolve
 
-**Write-ups:** [DESIGN.md](DESIGN.md) · [AI_USE.md](AI_USE.md)  
+**Write-ups:** [docs/DESIGN.md](docs/DESIGN.md) · [docs/AI_USE.md](docs/AI_USE.md) · [docs/WORK_AUDIT.md](docs/WORK_AUDIT.md) · [docs/ENABLEMENT.md](docs/ENABLEMENT.md)  
+**Process notes:** [docs/scratch/](docs/scratch/) (tickets + labels methodology)  
 **Outputs:** [results.jsonl](results.jsonl) · [reports/run_report.md](reports/run_report.md) · [reports/eval_report.md](reports/eval_report.md)
 
 ### How to run
 
 ```bash
+cd ops-inbox-agent
+
 # 1. Secrets (Inference API key — not a Provisioning key)
 cp .env.example .env   # then set OPENROUTER_API_KEY or OPENAI_API_KEY
 
@@ -167,7 +170,7 @@ we'll dig into your decisions, and we'll explore one new requirement together.
 ## Running the scaffold
 
 ```bash
-cd candidate-package
+cd ops-inbox-agent
 
 # run the (stub) pipeline over all requests -> writes results.jsonl
 python3 -m starter.pipeline

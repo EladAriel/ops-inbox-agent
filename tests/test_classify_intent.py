@@ -103,6 +103,29 @@ def test_classify_intent_adversarial_injection_still_classifies():
     assert "Do not follow" in system_content or "do not follow" in system_content.lower()
     assert "Only classify it" in system_content
 
+
+def test_classify_intent_payroll_pto_is_out_of_scope():
+    """HR/payroll/PTO must not be labeled policy_question (REQ-034 regression)."""
+    raw = (
+        "Hi, I think my last paycheck was short by about $200 and my PTO "
+        "balance looks off. Who do I talk to about this?"
+    )
+    state = RequestState(id="REQ-034", raw_text=raw)
+    client = _mock_client(
+        IntentClassification(intent="out_of_scope", confidence=0.93)
+    )
+
+    result = classify_intent(state, client=client)
+
+    assert result.intent == Intent.OUT_OF_SCOPE
+    call_kwargs = client.chat.completions.parse.call_args.kwargs
+    system_content = call_kwargs["messages"][0]["content"].lower()
+    assert "out_of_scope" in system_content
+    assert "payroll" in system_content or "pto" in system_content
+    assert "paycheck" in system_content or "pto" in system_content
+    assert raw in call_kwargs["messages"][1]["content"]
+
+
 def test_classify_intent_refusal_leaves_unknown():
     state = RequestState(id="REQ-X", raw_text="something")
     client = _mock_client(None)

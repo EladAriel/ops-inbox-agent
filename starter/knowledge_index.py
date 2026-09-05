@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from openai import OpenAI
 
@@ -170,8 +170,14 @@ class KnowledgeIndex:
         *,
         top_k: int = 4,
         filename_filter: Optional[set[str]] = None,
+        on_usage: Optional[Callable[[object], None]] = None,
     ) -> List[Chunk]:
-        """Retrieve the top-k most relevant chunks using cosine similarity."""
+        """Retrieve the top-k most relevant chunks using cosine similarity.
+
+        Optional ``on_usage`` receives the embeddings API response so callers
+        can attribute query-embedding tokens to a per-request audit record.
+        Index build/cache embedding cost is not passed through this hook.
+        """
         pool = [
             c
             for c in self.chunks
@@ -181,6 +187,8 @@ class KnowledgeIndex:
             return []
 
         q_resp = client.embeddings.create(model=model, input=[query])
+        if on_usage is not None:
+            on_usage(q_resp)
         q = list(q_resp.data[0].embedding)
         scored = sorted(
             pool,

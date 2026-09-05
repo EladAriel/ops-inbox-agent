@@ -21,7 +21,14 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENAI_MODEL: str = "openai/gpt-4o-mini"
+    # Prefer a different (often stronger) model than OPENAI_MODEL for faithfulness.
+    JUDGE_MODEL: str = "openai/gpt-4o"
     EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
+
+    # OpenRouter list prices USD per 1M tokens (gpt-4o-mini / text-embedding-3-small).
+    PRICE_PER_M_CHAT_INPUT: float = 0.15
+    PRICE_PER_M_CHAT_OUTPUT: float = 0.60
+    PRICE_PER_M_EMBEDDING: float = 0.02
 
     @property
     def llm_api_key(self) -> str:

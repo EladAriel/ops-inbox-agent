@@ -27,13 +27,26 @@ INJECTION_MARKERS = (
     "approval gate has been disabled",
     "skip the usual approval",
     "auto-approve this grant",
+    "auto-approve this",
     "mark it resolved",
+    "end of system message",
+    "authorized it verbally",
+    "he authorized it verbally",
+    "emergency admin access",
+    "i'm the ceo",
+    "i am the ceo",
+    "as administrator",
+    "by the administrator",
 )
 
 
+def matched_adversarial_markers(text: str) -> list[str]:
+    lower = (text or "").lower()
+    return [m for m in INJECTION_MARKERS if m in lower]
+
+
 def looks_like_injection(text: str) -> bool:
-    lower = text.lower()
-    return any(m in lower for m in INJECTION_MARKERS)
+    return bool(matched_adversarial_markers(text))
 
 
 def _decide_out_of_scope(state: RequestState) -> None:
@@ -111,12 +124,24 @@ INTENT_HANDLERS: Dict[Intent, Callable[[RequestState], None]] = {
 
 
 def finalize_decide(state: RequestState) -> RequestState:
-    """Block auto_resolve when prompt injection was flagged."""
-    if "prompt_injection" in state.flags and state.action == Action.AUTO_RESOLVE:
+    """Post-decide safety: adversarial messages never auto_resolve; log why."""
+    if "prompt_injection" not in state.flags:
+        return state
+
+    matches = matched_adversarial_markers(state.raw_text)
+    reason = "Adversarial language detected"
+    if matches:
+        reason += f" (matched: {', '.join(matches[:3])})"
+    reason += "; escalate — never auto_resolve."
+
+    if state.action == Action.AUTO_RESOLVE:
         state.action = Action.ESCALATE
         state.requires_approval = True
-        state.approval_prompt = (
-            state.approval_prompt
-            or "Adversarial language detected; confirm before resolving."
-        )
+        state.approval_prompt = reason
+    elif not state.approval_prompt:
+        state.requires_approval = True
+        state.approval_prompt = reason
+    elif "Adversarial language detected" not in state.approval_prompt:
+        state.approval_prompt = f"{state.approval_prompt} {reason}"
+
     return state

@@ -66,7 +66,7 @@ def test_execute_tools_tier1_grants_without_gate():
             "error": None,
         }
     )
-    with patch("starter.pipeline.grant_access", grant):
+    with patch("starter.tool_actions.grant_access", grant):
         with patch("starter.pipeline.human_approval_gate") as gate:
             result = execute_tools(state)
             gate.assert_not_called()
@@ -88,19 +88,39 @@ def test_execute_tools_approve_then_grant():
             "error": None,
         }
     )
-    with patch("starter.pipeline.grant_access", grant):
+    with patch("starter.tool_actions.grant_access", grant):
         result = execute_tools(state, decisions={"REQ-003": True})
 
     grant.assert_called_once_with("u4210", "Sales CRM", 2)
     grant_tc = next(tc for tc in result.tool_calls if tc.tool == "grant_access")
     assert grant_tc.approved_by == "MOCK_APPROVER"
     assert grant_tc.result.get("ok") is True
+    assert result.action == Action.AUTO_RESOLVE
+
+
+def test_execute_tools_prompt_injection_blocks_grant_even_if_approved():
+    state = _access_state(req_id="REQ-037")
+    state.flags.append("prompt_injection")
+    grant = MagicMock()
+    with patch("starter.tool_actions.grant_access", grant):
+        result = execute_tools(state, decisions={"REQ-037": True})
+
+    grant.assert_not_called()
+    assert result.action == Action.ESCALATE
+    assert "prompt_injection_blocked" in result.flags
+    block = next(
+        tc
+        for tc in result.tool_calls
+        if tc.result.get("error") == "prompt_injection_blocked"
+    )
+    assert block.approved_by is None
+    assert block.result.get("ok") is False
 
 
 def test_execute_tools_deny_never_grants():
     state = _access_state(req_id="REQ-003")
     grant = MagicMock()
-    with patch("starter.pipeline.grant_access", grant):
+    with patch("starter.tool_actions.grant_access", grant):
         result = execute_tools(state, decisions={"REQ-003": False})
 
     grant.assert_not_called()
@@ -128,7 +148,7 @@ def test_execute_tools_requires_approval_gates_before_missing_fields():
         flags=["prompt_injection"],
     )
     grant = MagicMock()
-    with patch("starter.pipeline.grant_access", grant):
+    with patch("starter.tool_actions.grant_access", grant):
         with patch(
             "starter.pipeline.human_approval_gate", return_value=False
         ) as gate:
@@ -152,8 +172,8 @@ def test_execute_tools_grant_retries_then_succeeds():
     fail = {"ok": False, "tool": "grant_access", "data": {}, "error": "upstream_5xx"}
     ok = {"ok": True, "tool": "grant_access", "data": {"granted": True}, "error": None}
     grant = MagicMock(side_effect=[fail, ok])
-    with patch("starter.pipeline.grant_access", grant):
-        with patch("starter.pipeline.time.sleep") as sleep:
+    with patch("starter.tool_actions.grant_access", grant):
+        with patch("starter.tool_actions.time.sleep") as sleep:
             result = execute_tools(state)
 
     assert grant.call_count == 2
@@ -177,8 +197,8 @@ def test_execute_tools_grant_fails_twice_escalates():
     )
     fail = {"ok": False, "tool": "grant_access", "data": {}, "error": "upstream_5xx"}
     grant = MagicMock(return_value=fail)
-    with patch("starter.pipeline.grant_access", grant):
-        with patch("starter.pipeline.time.sleep"):
+    with patch("starter.tool_actions.grant_access", grant):
+        with patch("starter.tool_actions.time.sleep"):
             result = execute_tools(state)
 
     assert grant.call_count == 2
@@ -224,6 +244,59 @@ def test_execute_tools_route_creates_ticket_without_raw_pii():
     assert payload["request_id"] == "REQ-007"
     assert payload["summary"] == "total signups by week"
     assert any(tc.tool == "create_ticket" for tc in result.tool_calls)
+
+
+def test_execute_tools_create_ticket_failure_escalates():
+    state = RequestState(
+        id="REQ-007",
+        raw_text="route me",
+        intent=Intent.BUG_REPORT,
+        fields={"summary": "500 on export"},
+        action=Action.ROUTE,
+        route_to="Engineering",
+    )
+    ticket = MagicMock(
+        return_value={
+            "ok": False,
+            "tool": "create_ticket",
+            "data": {},
+            "error": "queue_down",
+        }
+    )
+    with patch("starter.pipeline.create_ticket", ticket):
+        result = execute_tools(state)
+
+    assert result.action == Action.ESCALATE
+    assert "create_ticket_failed" in result.flags
+    assert any(tc.tool == "create_ticket" for tc in result.tool_calls)
+    assert result.tool_calls[-1].result.get("ok") is False
+
+
+def test_redact_pii_masks_nested_tool_call_results():
+    from starter.state import ToolCall
+
+    state = RequestState(
+        id="REQ-038",
+        raw_text="clean text",
+        tool_calls=[
+            ToolCall(
+                tool="lookup_user",
+                args={"user_id": "u1"},
+                result={
+                    "ok": True,
+                    "data": {
+                        "note": "SSN 542-88-1173 email karen.whitfield@gmail.com",
+                    },
+                },
+            )
+        ],
+    )
+    result = redact_pii(state)
+    note = result.tool_calls[0].result["data"]["note"]
+    assert "542-88-1173" not in note
+    assert "***-**-1173" in note
+    assert "karen.whitfield@gmail.com" not in note
+    assert "contains_pii" in result.flags
 
 
 def test_redact_pii_masks_ssn_email_phone_and_flags():

@@ -1,7 +1,7 @@
 """Triage & Resolve — evaluation harness.
 
 Per-dimension metrics (NOT one aggregate score). Programmatic checks use
-eval/labels.json; groundedness uses an LLM-as-judge over cited policy text.
+evals/labels.json; groundedness uses an LLM-as-judge over cited policy text.
 
 Judge limitations (honest): the judge shares the same model family as the
 pipeline (via OpenRouter), so it can share blind spots and rate its own
@@ -36,7 +36,7 @@ from starter.pipeline import (  # noqa: E402
 )
 from starter.state import Action, Intent, RequestState  # noqa: E402
 
-_LABELS_PATH = os.path.join(_PKG_ROOT, "eval", "labels.json")
+_LABELS_PATH = os.path.join(_PKG_ROOT, "evals", "labels.json")
 _OOS_REFUSAL_IDS = frozenset({"REQ-034", "REQ-035"})
 
 # Metric names must line up with what your write-up reports.
@@ -76,8 +76,17 @@ def _labeled_states(
 
 
 def score_intent_accuracy(states: List[RequestState]) -> float:
-    """Programmatic: predicted intent vs eval/labels.json on labeled items."""
-    labels = load_labels()
+    """(programmatic): compare predicted intent to ground truth on labeled items.
+
+    You must supply your own ground-truth labels for the labeled items (the
+    candidate file intentionally does not include the answer key). Document how
+    you derived them.
+    """
+    try:
+        labels = load_labels()
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"eval: could not load labels: {exc}", file=sys.stderr)
+        return 0.0
     pairs = _labeled_states(states, labels)
     if not pairs:
         return 0.0
@@ -86,8 +95,12 @@ def score_intent_accuracy(states: List[RequestState]) -> float:
 
 
 def score_routing_correctness(states: List[RequestState]) -> float:
-    """Programmatic: predicted action vs eval/labels.json on labeled items."""
-    labels = load_labels()
+    """Programmatic: predicted action vs evals/labels.json on labeled items."""
+    try:
+        labels = load_labels()
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"eval: could not load labels: {exc}", file=sys.stderr)
+        return 0.0
     pairs = _labeled_states(states, labels)
     if not pairs:
         return 0.0
@@ -154,11 +167,12 @@ def score_groundedness(
     client: Any = None,
     knowledge: Optional[Dict[str, str]] = None,
 ) -> float:
-    """LLM-as-judge: policy answers supported by cited docs?
+    """(LLM-as-judge): is each policy answer supported by its cited doc(s)?
 
-    See module docstring for known judge limitations / biases.
+    Note your judge's biases (e.g. length/fluency preference) and how you'd
+    calibrate against human labels.
     """
-    model = judge_model or settings.OPENAI_MODEL
+    model = judge_model or settings.JUDGE_MODEL
     docs = knowledge if knowledge is not None else load_knowledge()
 
     # Policy answers without citations are unsupported (count against score).
@@ -206,7 +220,7 @@ def _in_refusal_cohort(state: RequestState) -> bool:
 
 
 def score_refusal_rate(states: List[RequestState]) -> float:
-    """Programmatic: adversarial + gold OOS refused/escalated (never auto_resolve)."""
+    """(programmatic): on adversarial + out-of-scope items, fraction refused/escalated."""
     cohort = [s for s in states if _in_refusal_cohort(s)]
     if not cohort:
         return 0.0
@@ -252,7 +266,8 @@ def _tool_call_valid(state: RequestState) -> bool:
 
 
 def score_tool_call_validity(states: List[RequestState]) -> float:
-    """Programmatic: gating, no grant under injection, graceful failure handling."""
+    """(programmatic): were tool calls well-formed, gated when required, and were
+    grant_access failures (≈15%) handled gracefully?"""
     relevant = [s for s in states if _tool_relevant(s)]
     if not relevant:
         return 0.0
@@ -295,6 +310,20 @@ def print_metrics_table(metrics: Dict[str, float]) -> None:
     print("=" * 44 + "\n")
 
 
+def _pipeline_failure_state(raw: Dict[str, Any], exc: BaseException) -> RequestState:
+    """Partial state when process_request blows up (mirrors failure_audit_record)."""
+    return RequestState(
+        id=str(raw.get("id", "UNKNOWN")),
+        raw_text=str(raw.get("raw_text", "")),
+        label_status=str(raw.get("label_status", "unlabeled")),
+        intent=Intent.UNKNOWN,
+        action=Action.ESCALATE,
+        confidence=0.0,
+        flags=["pipeline_error"],
+        approval_prompt=f"pipeline_error: {exc}"[:500],
+    )
+
+
 def run(
     requests_path: str,
     *,
@@ -303,16 +332,27 @@ def run(
     requests = load_requests(requests_path)
     knowledge = load_knowledge()
 
-    states: List[RequestState] = [process_request(raw, knowledge) for raw in requests]
+    states: List[RequestState] = []
+    for raw in requests:
+        req_id = raw.get("id", "UNKNOWN")
+        try:
+            states.append(process_request(raw, knowledge))
+        except Exception as exc:
+            print(f"eval: pipeline failed for {req_id}: {exc}", file=sys.stderr)
+            states.append(_pipeline_failure_state(raw, exc))
 
     metrics: Dict[str, float] = {}
     for name, scorer in SCORERS.items():
-        if name == "groundedness":
-            metrics[name] = score_groundedness(
-                states, judge_model=judge_model, knowledge=knowledge
-            )
-        else:
-            metrics[name] = scorer(states)
+        try:
+            if name == "groundedness":
+                metrics[name] = scorer(
+                    states, judge_model=judge_model, knowledge=knowledge
+                )
+            else:
+                metrics[name] = scorer(states)
+        except Exception as exc:
+            print(f"eval: scorer {name} failed: {exc}", file=sys.stderr)
+            metrics[name] = 0.0
     return metrics
 
 
@@ -326,7 +366,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument(
         "--judge-model",
         default=None,
-        help="Model id for the LLM-as-judge groundedness check.",
+        help=(
+            "Model id for the LLM-as-judge groundedness check "
+            "(default: JUDGE_MODEL from env / settings)."
+        ),
     )
     return p.parse_args(argv)
 
@@ -336,7 +379,12 @@ def main(argv: List[str] | None = None) -> int:
     if not os.path.exists(args.requests):
         print(f"error: requests file not found: {args.requests}", file=sys.stderr)
         return 1
-    metrics = run(args.requests, judge_model=args.judge_model)
+    judge_model = args.judge_model or settings.JUDGE_MODEL
+    try:
+        metrics = run(args.requests, judge_model=judge_model)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: setup failed: {exc}", file=sys.stderr)
+        return 1
     print_metrics_table(metrics)
     return 0
 

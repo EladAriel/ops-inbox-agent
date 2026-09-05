@@ -174,3 +174,111 @@ def test_cost_and_latency_means():
     ]
     assert score_cost(states) == 0.2
     assert score_latency(states) == 200.0
+
+
+def test_intent_accuracy_missing_labels_returns_zero(monkeypatch):
+    def _boom():
+        raise FileNotFoundError("evals/labels.json")
+
+    monkeypatch.setattr("starter.run_evals.load_labels", _boom)
+    assert score_intent_accuracy([]) == 0.0
+
+
+def test_run_continues_when_one_process_request_fails(monkeypatch):
+    from starter.run_evals import METRIC_NAMES, run
+
+    raws = [
+        {"id": "OK", "raw_text": "hi", "label_status": "labeled"},
+        {"id": "BAD", "raw_text": "boom", "label_status": "labeled"},
+    ]
+
+    def fake_process(raw, knowledge, **_kwargs):
+        if raw["id"] == "BAD":
+            raise RuntimeError("simulated pipeline crash")
+        return RequestState(
+            id=raw["id"],
+            raw_text=raw["raw_text"],
+            label_status=raw["label_status"],
+            intent=Intent.BUG_REPORT,
+            action=Action.ROUTE,
+        )
+
+    captured: list = []
+
+    def capturing_intent(states):
+        captured.extend(states)
+        return 0.0
+
+    monkeypatch.setattr("starter.run_evals.load_requests", lambda _path: raws)
+    monkeypatch.setattr("starter.run_evals.load_knowledge", lambda: {})
+    monkeypatch.setattr("starter.run_evals.process_request", fake_process)
+    monkeypatch.setattr("starter.run_evals.score_intent_accuracy", capturing_intent)
+    monkeypatch.setattr("starter.run_evals.score_routing_correctness", lambda _s: 0.0)
+    monkeypatch.setattr("starter.run_evals.score_groundedness", lambda _s, **_k: 0.0)
+    monkeypatch.setattr("starter.run_evals.score_refusal_rate", lambda _s: 0.0)
+    monkeypatch.setattr("starter.run_evals.score_tool_call_validity", lambda _s: 0.0)
+    monkeypatch.setattr("starter.run_evals.score_cost", lambda _s: 0.0)
+    monkeypatch.setattr("starter.run_evals.score_latency", lambda _s: 0.0)
+    # SCORERS holds original function objects — rebuild dict to pick up patches
+    import starter.run_evals as re
+
+    monkeypatch.setattr(
+        re,
+        "SCORERS",
+        {
+            "intent_accuracy": capturing_intent,
+            "routing_correctness": lambda _s: 0.0,
+            "groundedness": lambda _s, **_k: 0.0,
+            "refusal_rate": lambda _s: 0.0,
+            "tool_call_validity": lambda _s: 0.0,
+            "avg_cost_usd": lambda _s: 0.0,
+            "avg_latency_ms": lambda _s: 0.0,
+        },
+    )
+
+    metrics = run("unused.jsonl")
+    assert set(metrics) == set(METRIC_NAMES)
+    assert len(captured) == 2
+    assert captured[0].id == "OK"
+    assert captured[1].id == "BAD"
+    assert "pipeline_error" in captured[1].flags
+    assert captured[1].action == Action.ESCALATE
+
+
+def test_run_scorer_isolation(monkeypatch):
+    from starter.run_evals import METRIC_NAMES, run
+    import starter.run_evals as re
+
+    monkeypatch.setattr(
+        "starter.run_evals.load_requests",
+        lambda _path: [{"id": "A", "raw_text": "x", "label_status": "labeled"}],
+    )
+    monkeypatch.setattr("starter.run_evals.load_knowledge", lambda: {})
+    monkeypatch.setattr(
+        "starter.run_evals.process_request",
+        lambda raw, _k, **_kw: RequestState(
+            id=raw["id"], raw_text=raw["raw_text"], label_status=raw["label_status"]
+        ),
+    )
+
+    def boom(_states):
+        raise RuntimeError("scorer boom")
+
+    monkeypatch.setattr(
+        re,
+        "SCORERS",
+        {
+            "intent_accuracy": boom,
+            "routing_correctness": lambda _s: 0.5,
+            "groundedness": lambda _s, **_k: 0.0,
+            "refusal_rate": lambda _s: 0.0,
+            "tool_call_validity": lambda _s: 0.0,
+            "avg_cost_usd": lambda _s: 0.0,
+            "avg_latency_ms": lambda _s: 0.0,
+        },
+    )
+
+    metrics = run("unused.jsonl")
+    assert set(metrics) == set(METRIC_NAMES)
+    assert metrics["intent_accuracy"] == 0.0
+    assert metrics["routing_correctness"] == 0.5

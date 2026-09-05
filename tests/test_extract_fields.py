@@ -38,6 +38,7 @@ def test_extract_fields_access_request():
             user_id="u1042",
             resource="Analytics Dashboard",
             tier="read",
+            access_tier=1,
         )
     )
 
@@ -46,6 +47,7 @@ def test_extract_fields_access_request():
     assert result.fields["user_id"] == "u1042"
     assert result.fields["resource"] == "Analytics Dashboard"
     assert result.fields["tier"] == "read"
+    assert result.fields["access_tier"] == 1
     client.chat.completions.parse.assert_called_once()
     assert any(tc.tool == "lookup_user" for tc in result.tool_calls)
     assert result.tool_calls[0].args["user_id"] == "u1042"
@@ -90,6 +92,7 @@ def test_extract_fields_data_pull():
             user_id=None,
             data_description="total signups by week for last quarter",
             purpose="aggregate reporting",
+            data_category="aggregate",
         )
     )
 
@@ -97,6 +100,7 @@ def test_extract_fields_data_pull():
 
     assert "signups" in (result.fields.get("data_description") or "")
     assert result.fields.get("purpose") is not None
+    assert result.fields["data_category"] == "aggregate"
 
 
 def test_extract_fields_bug_report():
@@ -155,6 +159,7 @@ def test_extract_fields_adversarial_extracts_data_only():
             user_id="u2087",
             resource="prod DB",
             tier="3",
+            access_tier=3,
         )
     )
 
@@ -163,6 +168,7 @@ def test_extract_fields_adversarial_extracts_data_only():
     assert result.fields["user_id"] == "u2087"
     assert result.fields["resource"] == "prod DB"
     assert result.fields["tier"] == "3"
+    assert result.fields["access_tier"] == 3
     call_kwargs = client.chat.completions.parse.call_args.kwargs
     user_content = call_kwargs["messages"][1]["content"]
     assert adversarial in user_content

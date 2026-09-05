@@ -68,7 +68,7 @@ Eval means: see `reports/eval_report.md` (~3.3 s; printed `avg_cost_usd` rounds 
 
 1. **Cheaper / smaller model for classify + extract** (easy cases); keep a stronger model only for ambiguous or policy grounding.
 2. **Skip retrieve + ground** when intent ≠ `policy_question` (already mostly true — keep it strict).
-3. **Cache** embedding index (done under `.scratch/`) and repeated policy-question answers.
+3. **Cache** embedding index (local runtime cache; ticket notes under `docs/scratch/`) and repeated policy-question answers.
 4. **Batch / lower-priced routing** for offline corpus runs when latency can wait.
 
 ## Deliberately not built / +2 days
